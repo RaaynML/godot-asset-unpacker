@@ -1,0 +1,224 @@
+import sys, os, pathlib, mmap, struct, re, argparse
+
+def main(args):
+	parser = argparse.ArgumentParser(description='assets unpacker for Godot games')
+	parser.add_argument('file', help="game resource pack (data.pck or game.exe)", type=argparse.FileType('r+b'))
+	parser.add_argument('--raw', help="do not unpack asset containers (.tex, .stex, .oggstr)", action=argparse.BooleanOptionalAction)
+	parser_args = parser.parse_args(args)
+	
+	unpack_containers = not parser_args.raw
+	
+	magic = bytes.fromhex('47 44 50 43') # GDPC
+	file_list = []
+	import_file_list = []
+	
+	resource_pack_file_name = pathlib.Path(parser_args.file.name).name
+	output_dir = os.path.abspath(resource_pack_file_name.replace(".", "_"))
+	
+	f = mmap.mmap(parser_args.file.fileno(), 0)
+	parser_args.file.close()
+
+	if f.read(4) == magic:
+		print(resource_pack_file_name + " looks like a .pck resource pack")
+		f.seek(0)
+	else:
+		f.seek(-4, os.SEEK_END)
+		if f.read(4) == magic:
+			print(resource_pack_file_name + " looks like a self-contained .exe")
+			f.seek(-12, os.SEEK_END)
+			main_offset = int.from_bytes(f.read(8), byteorder="little")
+			f.seek(f.tell() - main_offset - 8)
+			if f.read(4) == magic:
+				f.seek(f.tell() - 4)
+		else:
+			f.close()
+			print("Error: file not supported", file=sys.stderr)
+			sys.exit(1)
+	try:
+		package_headers = struct.unpack_from("IIIII16II", f.read(20 + 64 + 4))
+	except struct.error:
+		f.close()
+		print("Error: invalid package header", file=sys.stderr)
+		sys.exit(1)
+	print(resource_pack_file_name + " info:", package_headers)
+	file_count = package_headers[-1]
+
+	print("Reading metadata...")
+
+	for file_num in range(1, file_count + 1):
+		try:
+			filepath_length = int.from_bytes(f.read(4), byteorder="little")
+		except Exception:
+			print("Warning: failed to read filepath length, skipping file", file=sys.stderr)
+			continue
+		
+		if filepath_length < 1 or filepath_length > 65536:
+			print(f"Warning: invalid path length {filepath_length} for file {file_num}, skipping", file=sys.stderr)
+			f.seek(filepath_length + 8 + 8 + 16, os.SEEK_CUR)  # Skip problematic entry
+			continue
+		
+		try:
+			data = f.read(filepath_length + 8 + 8 + 16)
+			file_info = struct.unpack_from(f"<{filepath_length}sQQ16B", data)
+		except Exception as e:
+			print(f"Warning: metadata read failed for file {file_num}: {str(e)}", file=sys.stderr)
+			continue
+		
+		try:
+			path = file_info[0].decode("utf-8", errors="replace").replace("://","/").rstrip("\0")
+		except UnicodeDecodeError:
+			print(f"Warning: invalid UTF-8 in path for file {file_num}, skipping", file=sys.stderr)
+			continue
+		
+		offset, size = file_info[1:3]
+		md5 = "".join([format(x, 'x') for x in file_info[3:19]])
+		
+		# Validate file offset/size
+		if offset < 0 or size < 0 or offset + size > len(f):
+			print(f"Warning: invalid file bounds for {path} (offset={offset}, size={size}), skipping", file=sys.stderr)
+			continue
+		
+		# Sanitize path components
+		sanitized_path = []
+		for part in path.split('/'):
+			if not part or part == '.' or part == '..':
+				continue
+			sanitized_path.append(part)
+		safe_path = '/'.join(sanitized_path)
+		
+		if not safe_path:
+			print(f"Warning: empty path after sanitization for file {file_num}, skipping", file=sys.stderr)
+			continue
+		
+		file_list.append({
+			'path': safe_path,
+			'offset': offset,
+			'size': size,
+			'md5': md5
+		})
+
+	print("Unpacking ", file_count, " files...", sep="")
+	os.makedirs(output_dir, exist_ok=True)
+
+	for packed_file in file_list:
+		file_dir = os.path.join(output_dir, os.path.dirname(packed_file['path']))
+		file_name_full = os.path.basename(packed_file['path'])
+		
+		# Skip empty filenames
+		if not file_name_full:
+			print(f"Warning: empty filename for path {packed_file['path']}, skipping", file=sys.stderr)
+			continue
+			
+		# Create output directory
+		try:
+			os.makedirs(file_dir, exist_ok=True)
+		except OSError as e:
+			print(f"Warning: failed to create directory {file_dir}: {str(e)}", file=sys.stderr)
+			continue
+		
+		target_path = os.path.join(file_dir, file_name_full)
+		
+		# Write file content safely
+		try:
+			with open(target_path, "wb") as out_file:
+				f.seek(packed_file['offset'])
+				remaining = packed_file['size']
+				while remaining:
+					chunk_size = min(remaining, 1024 * 1024)  # 1MB chunks
+					chunk = f.read(chunk_size)
+					if not chunk:
+						break
+					out_file.write(chunk)
+					remaining -= len(chunk)
+		except OSError as e:
+			print(f"Error writing file {target_path}: {str(e)}", file=sys.stderr)
+			continue
+
+		# Process special files
+		if unpack_containers:
+			ext = os.path.splitext(file_name_full)[1].lower()
+			if ext == '.import':
+				try:
+					with open(target_path, "r", encoding="utf-8") as imp_file:
+						import_file_data = imp_file.read()
+					import_path = re.search(r"path=\"(.*?)\"", import_file_data)
+					import_source = re.search(r"source_file=\"(.*?)\"", import_file_data)
+					
+					if import_path and import_source:
+						ipath = import_path.group(1).replace("://", "/")
+						isource = import_source.group(1).replace("://", "/")
+						import_file_list.append({
+							"path": os.path.normpath(ipath),
+							"source": os.path.normpath(isource)
+						})
+				except Exception as e:
+					print(f"Error processing .import file {target_path}: {str(e)}", file=sys.stderr)
+			
+			elif ext in ('.stex', '.tex', '.oggstr'):
+				try:
+					with open(target_path, "rb") as container_file:
+						container_data = container_file.read()
+					unpacked = unpack_container(container_data)
+					if unpacked:
+						_, ext_data = unpacked
+						with open(target_path, "wb") as out_file:
+							out_file.write(ext_data)
+				except Exception as e:
+					print(f"Error processing container {target_path}: {str(e)}", file=sys.stderr)
+
+	f.close()
+	
+	# Process import renames
+	for imp in import_file_list:
+		try:
+			source_path = os.path.join(output_dir, imp["source"])
+			current_path = os.path.join(output_dir, imp["path"])
+			
+			if not os.path.exists(current_path):
+				continue
+				
+			if os.path.exists(source_path):
+				base, ext = os.path.splitext(source_path)
+				source_path = f"{base}_import{ext}"
+				
+			os.rename(current_path, source_path)
+		except Exception as e:
+			print(f"Error renaming import {imp['path']}: {str(e)}", file=sys.stderr)
+
+def unpack_container(data):
+	# WebP: RIFF header
+	start = data.find(b'RIFF')
+	if start >= 0 and start + 8 <= len(data):
+		size = int.from_bytes(data[start+4:start+8], byteorder="little")
+		end = start + 8 + size
+		if end <= len(data):
+			return ".webp", data[start:end]
+
+	# PNG: Header + IEND footer
+	png_header = b'\x89PNG\r\n\x1a\n'
+	start = data.find(png_header)
+	if start >= 0:
+		iend = data.find(b'IEND', start)
+		if iend >= 0 and iend + 8 <= len(data):
+			return ".png", data[start:iend+8]
+
+	# JPEG: Start/end markers
+	start = data.find(b'\xff\xd8\xff')
+	if start >= 0:
+		end = data.find(b'\xff\xd9', start)
+		if end >= 0:
+			return ".jpg", data[start:end+2]
+	
+	# Ogg: Header
+	start = data.find(b'OggS')
+	if start >= 0:
+		return ".ogg", data[start:]
+	
+	return None
+
+def append_to_filename(path, text):
+	base, ext = os.path.splitext(path)
+	return base + text + ext
+
+if __name__ == "__main__":
+	main(sys.argv[1:])
